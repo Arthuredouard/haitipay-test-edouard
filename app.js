@@ -6,7 +6,7 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// --- MIDDLEWARE : AUTHENTIFICATION PAR PIN (Header x-pin) ---
+// --- MIDDLEWARE : AUTHENTIFICATION ---
 const verifyPin = async (req, res, next) => {
     const pinHeader = req.headers['x-pin'];
     const phoneNumber = req.body.phoneNumber || req.body.senderPhone;
@@ -22,27 +22,23 @@ const verifyPin = async (req, res, next) => {
         }
         next();
     } catch (error) {
-        res.status(500).json({ error: "Erreur lors de la vérification du PIN." });
+        res.status(500).json({ error: "Erreur de sécurité serveur." });
     }
 };
 
 // --- ROUTES CLIENTS ---
 
-/**
- * 1. CRÉATION DE WALLET (Validation format + Âge 16 ans)
- */
+// 1. Création de Wallet
 app.post('/wallet/create', async (req, res) => {
     const { firstName, lastName, phoneNumber, dateOfBirth, pin } = req.body;
 
-    const haitiPhoneRegex = /^509[0-9]{8}$/;
-    if (!haitiPhoneRegex.test(phoneNumber)) {
-        return res.status(400).json({ error: "Le numéro doit être au format 509XXXXXXXX." });
+    if (!/^509[0-9]{8}$/.test(phoneNumber)) {
+        return res.status(400).json({ error: "Format invalide. Utilisez 509XXXXXXXX." });
     }
 
-    const birthDate = new Date(dateOfBirth);
-    const age = (new Date() - birthDate) / (1000 * 60 * 60 * 24 * 365.25);
+    const age = (new Date() - new Date(dateOfBirth)) / (1000 * 60 * 60 * 24 * 365.25);
     if (age < 16) {
-        return res.status(400).json({ error: "L'utilisateur doit avoir au moins 16 ans." });
+        return res.status(400).json({ error: "Âge minimum requis : 16 ans." });
     }
 
     try {
@@ -52,116 +48,100 @@ app.post('/wallet/create', async (req, res) => {
             [id, firstName, lastName, phoneNumber, dateOfBirth, pin]
         );
         res.status(201).json({ message: "Wallet créé avec succès", walletId: id });
-    } catch (error) {
-        res.status(500).json({ error: "Erreur lors de la création (Numéro peut-être déjà utilisé)." });
+    } catch (e) {
+        res.status(500).json({ error: "Erreur (Numéro déjà utilisé ou DB pleine)." });
     }
 });
 
-/**
- * 2. RECHARGE (Ledger -> Wallet avec 2% de frais)
- */
+// 2. Recharge (Cash-in avec 2% de frais)
 app.post('/wallet/recharge', verifyPin, async (req, res) => {
     const { phoneNumber, amount } = req.body;
-
-    if (amount < 50 || amount > 50000) {
-        return res.status(400).json({ error: "Montant doit être entre 50 et 50,000 HTG." });
-    }
-
     const fees = amount * 0.02;
-    const amountToCredit = amount - fees;
+    const netAmount = amount - fees;
 
-    const connection = await db.getConnection();
+    const conn = await db.getConnection();
     try {
-        await connection.beginTransaction();
+        await conn.beginTransaction();
 
-        // Vérification fonds Ledger
-        const [ledger] = await connection.query("SELECT balance FROM Ledger WHERE id = 'LEDGER_MASTER'");
-        if (ledger[0].balance < amount) {
-            throw new Error("Fonds insuffisants dans le Ledger Master.");
-        }
+        const [ledger] = await conn.query("SELECT balance FROM Ledger WHERE id = 'LEDGER_MASTER'");
+        if (ledger[0].balance < amount) throw new Error("Fonds Ledger insuffisants.");
 
-        // Mouvements
-        await connection.query("UPDATE Ledger SET balance = balance - ? WHERE id = 'LEDGER_MASTER'", [amount]);
-        await connection.query("UPDATE Wallets SET balance = balance + ? WHERE phoneNumber = ?", [amountToCredit, phoneNumber]);
-        await connection.query("UPDATE Ledger SET balance = balance + ? WHERE id = 'LEDGER_MASTER'", [fees]); // Les frais restent/retournent au Ledger
+        await conn.query("UPDATE Ledger SET balance = balance - ? WHERE id = 'LEDGER_MASTER'", [amount]);
+        await conn.query("UPDATE Wallets SET balance = balance + ? WHERE phoneNumber = ?", [netAmount, phoneNumber]);
+        await conn.query("UPDATE Ledger SET balance = balance + ? WHERE id = 'LEDGER_MASTER'", [fees]);
 
-        await connection.query(
+        await conn.query(
             "INSERT INTO Transactions (id, type, receiver, amount, fees, status) VALUES (?, 'RECHARGE', ?, ?, ?, 'SUCCESS')",
-            [uuidv4(), phoneNumber, amountToCredit, fees]
+            [uuidv4(), phoneNumber, netAmount, fees]
         );
 
-        await connection.commit();
-        res.json({ message: "Recharge réussie", credited: amountToCredit, fees: fees });
-    } catch (error) {
-        await connection.rollback();
-        res.status(500).json({ error: error.message });
+        await conn.commit();
+        res.json({ message: "Recharge réussie", montant_net: netAmount, frais: fees });
+    } catch (e) {
+        await conn.rollback();
+        res.status(400).json({ error: e.message });
     } finally {
-        connection.release();
+        conn.release();
     }
 });
 
-/**
- * 3. TRANSFERT (Wallet -> Wallet + 2% Frais)
- */
+// 3. Transfert P2P
 app.post('/wallet/transfer', verifyPin, async (req, res) => {
     const { phoneNumber, receiverPhone, amount } = req.body;
     const fees = amount * 0.02;
-    const totalDebit = amount + fees;
+    const totalToPay = amount + fees;
 
-    const connection = await db.getConnection();
+    const conn = await db.getConnection();
     try {
-        await connection.beginTransaction();
+        await conn.beginTransaction();
 
-        const [sender] = await connection.query("SELECT balance FROM Wallets WHERE phoneNumber = ?", [phoneNumber]);
-        if (!sender[0] || sender[0].balance < totalDebit) {
-            throw new Error("Solde insuffisant (Frais de 2% inclus).");
-        }
+        const [sender] = await conn.query("SELECT balance FROM Wallets WHERE phoneNumber = ?", [phoneNumber]);
+        if (!sender[0] || sender[0].balance < totalToPay) throw new Error("Solde insuffisant (Frais inclus).");
 
-        await connection.query("UPDATE Wallets SET balance = balance - ? WHERE phoneNumber = ?", [totalDebit, phoneNumber]);
-        await connection.query("UPDATE Wallets SET balance = balance + ? WHERE phoneNumber = ?", [amount, receiverPhone]);
-        await connection.query("UPDATE Ledger SET balance = balance + ? WHERE id = 'LEDGER_MASTER'", [fees]);
+        await conn.query("UPDATE Wallets SET balance = balance - ? WHERE phoneNumber = ?", [totalToPay, phoneNumber]);
+        await conn.query("UPDATE Wallets SET balance = balance + ? WHERE phoneNumber = ?", [amount, receiverPhone]);
+        await conn.query("UPDATE Ledger SET balance = balance + ? WHERE id = 'LEDGER_MASTER'", [fees]);
 
-        await connection.query(
+        await conn.query(
             "INSERT INTO Transactions (id, type, sender, receiver, amount, fees, status) VALUES (?, 'TRANSFER', ?, ?, ?, ?, 'SUCCESS')",
             [uuidv4(), phoneNumber, receiverPhone, amount, fees]
         );
 
-        await connection.commit();
-        res.json({ message: "Transfert réussi", amountSent: amount, fees: fees });
-    } catch (error) {
-        await connection.rollback();
-        res.status(500).json({ error: error.message });
+        await conn.commit();
+        res.json({ message: "Transfert effectué avec succès" });
+    } catch (e) {
+        await conn.rollback();
+        res.status(400).json({ error: e.message });
     } finally {
-        connection.release();
+        conn.release();
     }
 });
 
-// --- ROUTES ADMIN  ---
+// --- ROUTES ADMIn ---
 
-/**
- * 7. STATUT DU LEDGER
- */
+// Route 7 : Statut du Ledger
 app.get('/admin/ledger/status', async (req, res) => {
     try {
-        const [rows] = await db.query("SELECT balance, last_update FROM Ledger WHERE id = 'LEDGER_MASTER'");
-        res.json({ status: "success", data: rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: "Erreur accès Ledger." });
+        const [rows] = await db.query("SELECT balance FROM Ledger WHERE id = 'LEDGER_MASTER'");
+        if (rows.length === 0) return res.status(404).json({ error: "Ledger non trouvé" });
+        res.json({ status: "success", balance: rows[0].balance });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
-/**
- * 8. HISTORIQUE DU LEDGER
- */
+// Route 8 : Historique Ledger
 app.get('/admin/ledger/transactions', async (req, res) => {
-    const limit = parseInt(req.query.limit) || 50;
     try {
-        const [rows] = await db.query("SELECT * FROM Transactions ORDER BY created_at DESC LIMIT ?", [limit]);
-        res.json({ status: "success", count: rows.length, transactions: rows });
-    } catch (error) {
-        res.status(500).json({ error: "Erreur accès historique." });
+        const [rows] = await db.query("SELECT * FROM Transactions ORDER BY createdAt DESC LIMIT 50");
+        res.json({ status: "success", transactions: rows });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 API HaitiPay Conforme sur le port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`🚀 API HaitiPay prête sur http://localhost:${PORT}`);
+    console.log(`Vérifiez le statut ici: http://localhost:${PORT}/admin/ledger/status`);
+});
