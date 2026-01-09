@@ -35,6 +35,7 @@ Atomicité SQL : Utilisation de transactions ( START TRANSACTION, COMMIT, ROLLBA
  Installation et Déploiement
 Installation des dépendances :
 npm install
+Importer database dans Mysql
 Lancement d serveur :
 node app.js
 
